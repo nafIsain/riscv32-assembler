@@ -10,8 +10,14 @@
     <div class="container">
         <header>
             <h1>RV32I Assembler</h1>
-            <button id="downloadBtn" style="background:#2d8a4e; margin-left:10px;">Download .hex</button>
-            <button id="assembleBtn">Assemble</button>
+            <div class="controls">
+                <label title="Inserts 3 NOPs between instructions to prevent hazards during debugging">
+                    <input type="checkbox" id="debugMode"> Pipeline Debug (Auto-NOP)
+                </label>
+                <button id="assembleBtn">Assemble</button>
+                <button id="downloadHexBtn" class="secondary">.hex</button>
+                <button id="downloadMifBtn" class="secondary">.mif</button>
+            </div>
         </header>
         <main>
             <section class="editor">
