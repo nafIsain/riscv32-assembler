@@ -19,30 +19,49 @@ function assemble() {
 
     const lines = input.split('\n');
     let machineCode = [];
+    let symbolTable = {}; // Stores label -> address mapping
+    let cleanedLines = []; // Stores { pc, tokens, originalLine }
 
-    lines.forEach((line, index) => {
+    // --- PASS 1: Symbol Discovery & Cleaning ---
+    let pc = 0; // Program Counter (in bytes)
+    
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].split('#')[0].split('//')[0].trim();
+        if (!line) continue;
+
+        // Check for Label (ends with :)
+        if (line.endsWith(':')) {
+            let labelName = line.slice(0, -1); // Remove colon
+            if (symbolTable[labelName] !== undefined) {
+                logArea.innerHTML += `Error: Duplicate label '${labelName}' at line ${i+1}<br>`;
+                return;
+            }
+            symbolTable[labelName] = pc;
+            continue; // Labels don't advance PC themselves (unless code follows on same line, but let's enforce separate lines for simplicity)
+        }
+
+        // Tokenize
+        let tokens = line.replace(/,/g, ' ').trim().split(/\s+/);
+        cleanedLines.push({ pc: pc, tokens: tokens, lineNumber: i + 1 });
+        pc += 4; // Each instruction is 4 bytes
+    }
+
+    // --- PASS 2: Code Generation ---
+    for (let instr of cleanedLines) {
         try {
-            // Clean: remove comments, trim
-            let cleanLine = line.split('#')[0].split('//')[0].trim();
-            if (!cleanLine) return; 
-
-            // Tokenize: split by space or comma
-            let tokens = cleanLine.replace(/,/g, ' ').trim().split(/\s+/);
-            
-            let hex = processInstruction(tokens);
+            let hex = processInstruction(instr.tokens, instr.pc, symbolTable);
             machineCode.push(hex);
         } catch (e) {
-            logArea.innerHTML += `Line ${index + 1} Error: ${e.message}<br>`;
+            logArea.innerHTML += `Line ${instr.lineNumber} Error: ${e.message}<br>`;
         }
-    });
+    }
 
     outputArea.value = machineCode.join('\n');
 }
 
-function processInstruction(tokens) {
+function processInstruction(tokens, currentPC, symbolTable) {
     const opcodeName = tokens[0].toLowerCase();
 
-    // Map instructions to their types and codes
     switch (opcodeName) {
         // R-Type
         case 'add': return encodeRType(tokens, 0x33, 0x0, 0x00);
@@ -61,9 +80,9 @@ function processInstruction(tokens) {
         case 'xori': return encodeIType(tokens, 0x13, 0x4);
         case 'ori':  return encodeIType(tokens, 0x13, 0x6);
         case 'andi': return encodeIType(tokens, 0x13, 0x7);
-        case 'slli': return encodeIType(tokens, 0x13, 0x1); // diff format (shamt), but I-type fits
-        case 'srli': return encodeIType(tokens, 0x13, 0x5); 
-        case 'srai': return encodeIType(tokens, 0x13, 0x5, 0x20); // Handled specially inside? actually just high bits of imm.
+        case 'slli': return encodeIType(tokens, 0x13, 0x1);
+        case 'srli': return encodeIType(tokens, 0x13, 0x5);
+        case 'srai': return encodeIType(tokens, 0x13, 0x5, 0x20);
 
         // I-Type (Loads)
         case 'lb':   return encodeIType(tokens, 0x03, 0x0);
@@ -71,100 +90,177 @@ function processInstruction(tokens) {
         case 'lw':   return encodeIType(tokens, 0x03, 0x2);
         case 'lbu':  return encodeIType(tokens, 0x03, 0x4);
         case 'lhu':  return encodeIType(tokens, 0x03, 0x5);
-
-        // I-Type (JALR)
         case 'jalr': return encodeIType(tokens, 0x67, 0x0);
-        
+
+        // S-Type (Stores) - Note: sw rs2, offset(rs1)
+        case 'sb': return encodeSType(tokens, 0x23, 0x0);
+        case 'sh': return encodeSType(tokens, 0x23, 0x1);
+        case 'sw': return encodeSType(tokens, 0x23, 0x2);
+
+        // B-Type (Branches)
+        case 'beq': return encodeBType(tokens, currentPC, symbolTable, 0x63, 0x0);
+        case 'bne': return encodeBType(tokens, currentPC, symbolTable, 0x63, 0x1);
+        case 'blt': return encodeBType(tokens, currentPC, symbolTable, 0x63, 0x4);
+        case 'bge': return encodeBType(tokens, currentPC, symbolTable, 0x63, 0x5);
+        case 'bltu': return encodeBType(tokens, currentPC, symbolTable, 0x63, 0x6);
+        case 'bgeu': return encodeBType(tokens, currentPC, symbolTable, 0x63, 0x7);
+
+        // J-Type (Jumps)
+        case 'jal': return encodeJType(tokens, currentPC, symbolTable, 0x6F);
+
         default:
             throw new Error(`Unknown instruction: ${opcodeName}`);
     }
 }
 
-// --- HELPER FUNCTIONS ---
+// --- ENCODERS ---
 
-function parseRegister(regStr) {
-    if (!regStr) throw new Error("Missing register operand");
-    regStr = regStr.toLowerCase();
-    
-    // Check ABI map first (sp, ra, etc.)
-    if (REGISTER_MAP.hasOwnProperty(regStr)) {
-        return REGISTER_MAP[regStr];
-    }
-    
-    // Check x0-x31
-    if (regStr.startsWith('x')) {
-        const num = parseInt(regStr.substring(1));
-        if (num >= 0 && num <= 31) return num;
-    }
-    
-    throw new Error(`Invalid register: ${regStr}`);
-}
-
-function parseImmediate(immStr) {
-    if (!immStr) throw new Error("Missing immediate operand");
-    // Handles hex (0x10), binary (0b10), and decimal (-10)
-    let val = parseInt(immStr); 
-    if (isNaN(val)) throw new Error(`Invalid immediate: ${immStr}`);
-    return val;
-}
-
-// R-Type: funct7 | rs2 | rs1 | funct3 | rd | opcode
 function encodeRType(tokens, opcode, funct3, funct7) {
-    if (tokens.length !== 4) throw new Error("R-Type requires 3 operands (rd, rs1, rs2)");
+    if (tokens.length !== 4) throw new Error("R-Type requires 3 operands");
     const rd = parseRegister(tokens[1]);
     const rs1 = parseRegister(tokens[2]);
     const rs2 = parseRegister(tokens[3]);
-
-    const instruction = 
-        (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
-    
-    return toHex(instruction);
+    const inst = (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
+    return toHex(inst);
 }
 
-// I-Type: imm[11:0] | rs1 | funct3 | rd | opcode
 function encodeIType(tokens, opcode, funct3, specialFunct7 = 0) {
-    // Standard I-Type: addi rd, rs1, imm
-    // Load I-Type:     lw rd, imm(rs1)  <-- We need to handle this syntax!
-    
     let rd, rs1, imm;
-
-    // Check for Load Syntax: lw x1, 0(x2)
-    const loadRegex = /^(-?\d+|0x[0-9a-fA-F]+)\(([a-zA-Z0-9]+)\)$/;
-    const match = tokens[2].match(loadRegex);
-
-    if (match) {
-        // Syntax is: lw rd, offset(base)
-        // tokens = ["lw", "rd", "offset(base)"]
+    // Handle lw x1, 4(x2) syntax
+    const loadMatch = tokens[2].match(/^(-?\d+|0x[0-9a-fA-F]+)\(([a-zA-Z0-9]+)\)$/);
+    if (loadMatch) {
         rd = parseRegister(tokens[1]);
-        imm = parseImmediate(match[1]);
-        rs1 = parseRegister(match[2]);
+        imm = parseImmediate(loadMatch[1]);
+        rs1 = parseRegister(loadMatch[2]);
     } else {
-        // Standard Syntax: addi rd, rs1, imm
-        if (tokens.length !== 4) throw new Error("I-Type requires 3 operands");
         rd = parseRegister(tokens[1]);
         rs1 = parseRegister(tokens[2]);
         imm = parseImmediate(tokens[3]);
     }
+    
+    if (specialFunct7 !== 0) imm = (imm & 0x1F) | (specialFunct7 << 5);
+    
+    const inst = ((imm & 0xFFF) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
+    return toHex(inst);
+}
 
-    // Handle shift immediates (srai, srli, slli) - only 5 bits, top 7 bits are funct7
-    // For SRAI, specialFunct7 is 0x20 (0100000). For others it's 0.
-    if (specialFunct7 !== 0) {
-        imm = imm & 0x1F; // Only keep bottom 5 bits
-        imm = imm | (specialFunct7 << 5); // Add the funct7 code
+function encodeSType(tokens, opcode, funct3) {
+    // Syntax: sw rs2, offset(rs1)  -> tokens: ["sw", "x1", "4(x2)"]
+    if (tokens.length !== 3) throw new Error("S-Type requires 2 operands (rs2, offset(rs1))");
+    
+    const rs2 = parseRegister(tokens[1]); // Source is the first operand!
+    
+    const match = tokens[2].match(/^(-?\d+|0x[0-9a-fA-F]+)\(([a-zA-Z0-9]+)\)$/);
+    if (!match) throw new Error("Invalid Store syntax. Use: sw rs2, offset(rs1)");
+    
+    const imm = parseImmediate(match[1]);
+    const rs1 = parseRegister(match[2]);
+
+    const imm11_5 = (imm >> 5) & 0x7F;
+    const imm4_0 = imm & 0x1F;
+
+    const inst = (imm11_5 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (imm4_0 << 7) | opcode;
+    return toHex(inst);
+}
+
+function encodeBType(tokens, currentPC, symbolTable, opcode, funct3) {
+    // Syntax: beq rs1, rs2, label
+    if (tokens.length !== 4) throw new Error("B-Type requires 3 operands");
+    
+    const rs1 = parseRegister(tokens[1]);
+    const rs2 = parseRegister(tokens[2]);
+    const label = tokens[3];
+
+    let targetPC = symbolTable[label];
+    if (targetPC === undefined) {
+        // Allow immediate offsets too (beq x1, x2, -4)
+        try { targetPC = currentPC + parseImmediate(label); } 
+        catch { throw new Error(`Undefined label: ${label}`); }
     }
 
-    // Sign extension handling for 12-bit immediates
-    // JS bitwise ops are 32-bit signed, but we need to pack bits carefully.
-    // If imm is -1 (0xFFFFFFFF), we need 0xFFF.
-    const imm12 = imm & 0xFFF; 
+    let offset = targetPC - currentPC;
+    
+    // RISC-V Branch offsets are multiples of 2. Bit 0 is ignored.
+    if (offset % 2 !== 0) throw new Error("Branch offset must be multiple of 2");
+    
+    // Scramble Immediate: imm[12|10:5|4:1|11]
+    let imm = offset >> 1; // Drop bit 0 immediately
+    
+    let imm12 = (offset >> 12) & 1;
+    let imm11 = (offset >> 11) & 1;
+    let imm10_5 = (offset >> 5) & 0x3F;
+    let imm4_1 = (offset >> 1) & 0xF;
 
-    const instruction = 
-        (imm12 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
+    const inst = (imm12 << 31) | (imm10_5 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (imm4_1 << 8) | (imm11 << 7) | opcode;
+    return toHex(inst);
+}
 
-    return toHex(instruction);
+function encodeJType(tokens, currentPC, symbolTable, opcode) {
+    // Syntax: jal rd, label  OR  jal label (pseudo for jal ra, label)
+    let rd, label;
+    
+    if (tokens.length === 2) {
+        rd = 1; // ra (x1)
+        label = tokens[1];
+    } else {
+        rd = parseRegister(tokens[1]);
+        label = tokens[2];
+    }
+
+    let targetPC = symbolTable[label];
+    if (targetPC === undefined) {
+         try { targetPC = currentPC + parseImmediate(label); } 
+         catch { throw new Error(`Undefined label: ${label}`); }
+    }
+
+    let offset = targetPC - currentPC;
+    
+    // Scramble Immediate: imm[20|10:1|11|19:12]
+    // Bit 0 is dropped
+    
+    let imm20 = (offset >> 20) & 1;
+    let imm10_1 = (offset >> 1) & 0x3FF;
+    let imm11 = (offset >> 11) & 1;
+    let imm19_12 = (offset >> 12) & 0xFF;
+
+    const inst = (imm20 << 31) | (imm19_12 << 12) | (imm11 << 20) | (imm10_1 << 21) | (rd << 7) | opcode;
+    return toHex(inst);
+}
+
+// --- HELPERS (Keep these same as before) ---
+function parseRegister(regStr) {
+    if (!regStr) throw new Error("Missing register");
+    regStr = regStr.toLowerCase();
+    if (REGISTER_MAP.hasOwnProperty(regStr)) return REGISTER_MAP[regStr];
+    if (regStr.startsWith('x')) return parseInt(regStr.substring(1));
+    throw new Error(`Invalid register: ${regStr}`);
+}
+
+function parseImmediate(immStr) {
+    if (!immStr) throw new Error("Missing immediate");
+    return parseInt(immStr);
 }
 
 function toHex(value) {
-    // Force unsigned 32-bit
     return (value >>> 0).toString(16).padStart(8, '0').toUpperCase();
+}
+document.getElementById('downloadBtn').addEventListener('click', downloadHex);
+
+function downloadHex() {
+    const hexContent = document.getElementById('hexOutput').value;
+    if (!hexContent) {
+        alert("Assemble first!");
+        return;
+    }
+    
+    // Create a blob and trigger download
+    const blob = new Blob([hexContent], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'program.hex'; // The filename for your FPGA project
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
 }
